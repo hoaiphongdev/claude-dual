@@ -69,7 +69,7 @@ for L in "CI One" "CI Two"; do
   case "$id" in io.github.hoaiphongdev.claude-dual.*) echo "bundle id: $id" ;; *) fail "unexpected bundle id $id" ;; esac
   codesign --verify --deep "$A" || fail "launcher signature invalid: $A"
   icon="$A/Contents/Resources/applet.icns"
-  [ -s "$icon" ] && [ "$(wc -c <"$icon")" -gt 10000 ] || fail "custom icon was not generated for $A"
+  if [ ! -s "$icon" ] || [ "$(wc -c <"$icon")" -le 10000 ]; then fail "custom icon was not generated for $A"; fi
   [ ! -e "$A/Contents/Resources/Assets.car" ] || fail "Assets.car still present (would hide custom icon)"
 done
 cp "$HOME/Applications/Claude CI One.app/Contents/Resources/applet.icns" "$ART/icon-ci-one.icns"

@@ -241,7 +241,7 @@ file_url() {
 
 lsregister() {
   local t=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-  [ -x "$t" ] && "$t" "$@" >/dev/null 2>&1 || true
+  if [ -x "$t" ]; then "$t" "$@" >/dev/null 2>&1 || true; fi
 }
 
 # ------------------------------------------------------------------- icons
