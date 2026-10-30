@@ -12,14 +12,41 @@ permissions:
   contents: read
 
 jobs:
+  commit-format:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Every commit must be "<emoji> <type>: <message>"
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -n "$PR_BASE" ]; then range="$PR_BASE..$PR_HEAD"
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE" 2>/dev/null; then range="$AFTER^!"
+          else range="$BEFORE..$AFTER"; fi
+          status=0
+          for c in $(git rev-list --no-merges "$range"); do
+            if ./scripts/check-commit-msg.sh -m "$(git log -1 --format=%B "$c")"; then
+              echo "ok   $(git log -1 --format='%h %s' "$c")"
+            else
+              status=1
+            fi
+          done
+          exit $status
+
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck -x claude-dual tests/*.sh
+        run: shellcheck -x claude-dual scripts/*.sh .githooks/commit-msg tests/*.sh
       - name: unit tests
-        run: bash tests/unit.sh
+        run: bash tests/unit.sh && bash tests/commit-msg.sh
 
   macos:
     needs: lint
@@ -33,7 +60,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Unit tests with macOS bash 3.2
-        run: /bin/bash --version | head -1 && /bin/bash tests/unit.sh
+        run: /bin/bash --version | head -1 && /bin/bash tests/unit.sh && /bin/bash tests/commit-msg.sh
 
       - name: Install latest Claude Desktop
         run: |
