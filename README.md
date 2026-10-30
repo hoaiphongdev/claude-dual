@@ -1,10 +1,8 @@
 # claude-dual
 
-[![CI](https://github.com/hoaiphongdev/claude-dual/actions/workflows/ci.yml/badge.svg)](https://github.com/hoaiphongdev/claude-dual/actions/workflows/ci.yml)
-
 Run several **Claude Desktop** accounts side by side on one Mac — each with its own login, chats, settings, connectors and Claude Code sessions. No logging out, no mixing.
 
-> Unofficial. Not affiliated with or endorsed by Anthropic. It relies on Claude Desktop honouring `--user-data-dir`; CI checks that against the latest Claude Desktop every day.
+> Unofficial. Not affiliated with or endorsed by Anthropic. It relies on Claude Desktop honouring `--user-data-dir`; run `./claude-dual doctor` after a Claude update to confirm profiles are still isolated.
 
 ## How it works
 
@@ -51,10 +49,6 @@ Colours: `indigo teal rose amber violet sky emerald slate`, or `#RRGGBB`. Add `-
 - The first time you open a launcher, macOS may ask for confirmation: right-click → Open.
 - macOS only. On Windows, Claude Desktop 2.42304 currently ignores `--user-data-dir` ([#103068](https://github.com/anthropics/claude-code/issues/103068)).
 
-## How compatibility is checked
-
-[`tests/e2e-macos.sh`](tests/e2e-macos.sh) runs in GitHub Actions on real macOS runners, daily, against the latest Claude Desktop from Homebrew. It creates two profiles, opens both side by side, and fails if Claude writes to the default folder, shares a process between profiles, drops `CLAUDE_CONFIG_DIR`, or opens a duplicate when a launcher is clicked twice. Sign-in needs a real account, so it isn't tested in CI.
-
 ## Uninstall
 
 ```bash
@@ -63,7 +57,7 @@ Colours: `indigo teal rose amber violet sky emerald slate`, or `#RRGGBB`. Add `-
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Commit messages must follow `<emoji> <type>: <message>`, e.g. `✨ feat: add --color option`; this is enforced by a git hook and in CI.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Commit messages must follow `<emoji> <type>: <message>`, e.g. `✨ feat: add --color option`; this is enforced by a git hook.
 
 ## License
 

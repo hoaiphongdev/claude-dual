@@ -6,7 +6,7 @@ Every commit subject MUST be `<emoji> <type>[(scope)][!]: <message>`, with the e
 
 Allowed pairs: ✨ feat · 🐛 fix · 📝 docs · 💄 style · ♻️ refactor · ⚡️ perf · ✅ test · 👷 ci · 🔧 chore · 🔒 security · 🔖 release · ⏪ revert
 
-Before committing, run `git config core.hooksPath .githooks` once so the hook validates the message. Never bypass it with `--no-verify`. CI rejects non-conforming commits. Full table in CONTRIBUTING.md.
+Before committing, run `git config core.hooksPath .githooks` once so the hook validates the message. Never bypass it with `--no-verify`. Full table in CONTRIBUTING.md.
 
 ## Other conventions
 

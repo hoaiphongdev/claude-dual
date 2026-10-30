@@ -27,7 +27,7 @@ The emoji must match the type:
 | ♻️ | `refactor` | Code change that is neither a fix nor a feature |
 | ⚡️ | `perf` | Performance |
 | ✅ | `test` | Tests |
-| 👷 | `ci` | CI / GitHub Actions |
+| 👷 | `ci` | CI / build automation |
 | 🔧 | `chore` | Tooling, config, maintenance |
 | 🔒 | `security` | Security fix or hardening |
 | 🔖 | `release` | Version bump / release |
@@ -35,15 +35,11 @@ The emoji must match the type:
 
 Scope is optional, lowercase (`a-z 0-9 . _ / -`). Add `!` for breaking changes.
 
-It is enforced in two places:
+It is enforced by a `commit-msg` hook. Enable it once per clone:
 
-- **Locally**, by a `commit-msg` hook. Enable it once per clone:
-
-  ```bash
-  git config core.hooksPath .githooks
-  ```
-
-- **In CI**, by the `commit-format` job, which checks every commit in a push or pull request.
+```bash
+git config core.hooksPath .githooks
+```
 
 Check a message by hand: `./scripts/check-commit-msg.sh -m "✨ feat: something"`
 
@@ -55,6 +51,4 @@ bash tests/unit.sh
 bash tests/commit-msg.sh
 ```
 
-`claude-dual` must stay compatible with macOS's built-in bash 3.2 (no associative arrays, no `${var,,}`, no `mapfile`). CI runs the unit tests with `/bin/bash` on macOS to catch this.
-
-`tests/e2e-macos.sh` opens real Claude Desktop instances. It runs in CI on macOS runners; run it locally only if you're fine with it creating and removing "Claude CI One/Two" launchers.
+`claude-dual` must stay compatible with macOS's built-in bash 3.2 (no associative arrays, no `${var,,}`, no `mapfile`). Run the unit tests with `/bin/bash` on a Mac to check this.
