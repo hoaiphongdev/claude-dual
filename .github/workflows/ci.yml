@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Every day: catches a new Claude Desktop release that breaks profiles.
+    - cron: "23 1 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x claude-dual tests/*.sh
+      - name: unit tests
+        run: bash tests/unit.sh
+
+  macos:
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests with macOS bash 3.2
+        run: /bin/bash --version | head -1 && /bin/bash tests/unit.sh
+
+      - name: Install latest Claude Desktop
+        run: |
+          brew update >/dev/null || true
+          brew install --cask claude
+          # CI only: skip the first-launch "downloaded from the Internet" dialog
+          xattr -dr com.apple.quarantine /Applications/Claude.app || true
+          echo "Claude $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/Claude.app/Contents/Info.plist)"
+
+      - name: End-to-end (two profiles side by side)
+        run: /bin/bash tests/e2e-macos.sh
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ matrix.os }}
+          path: e2e-artifacts/
+          if-no-files-found: ignore

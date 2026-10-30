@@ -1,0 +1,783 @@
+#!/bin/bash
+# claude-dual — run several Claude Desktop accounts side by side on macOS.
+# https://github.com/hoaiphongdev/claude-dual · MIT License
+#
+# Each profile is a tiny launcher app ("Claude <Label>.app") that starts the
+# real, unmodified Claude.app with its own --user-data-dir (login, chats,
+# settings, connectors) and its own CLAUDE_CONFIG_DIR (Claude Code sessions).
+#
+# Written for the bash 3.2 that ships with macOS: no associative arrays,
+# no ${var,,}, no mapfile.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+LAUNCHER_VERSION="1"
+CLAUDE_BUNDLE_ID="com.anthropic.claudefordesktop"
+ID_PREFIX="io.github.hoaiphongdev.claude-dual"
+MARKER="claude-dual.profile"
+
+BASE_DIR="${CLAUDE_DUAL_HOME:-$HOME/Library/Application Support/claude-dual}"
+PROFILES_DIR="$BASE_DIR/profiles"
+LAUNCHER_DIR="${CLAUDE_DUAL_LAUNCHER_DIR:-$HOME/Applications}"
+DEFAULT_DATA_DIR="$HOME/Library/Application Support/Claude"
+
+# name:hex — launcher icon colours
+PALETTE="indigo:#4F46E5 teal:#0D9488 rose:#E11D48 amber:#D97706 violet:#7C3AED sky:#0284C7 emerald:#059669 slate:#475569"
+
+ASSUME_YES=0
+
+if [ -t 1 ]; then
+  C_B=$'\033[1m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_R=$'\033[31m'; C_D=$'\033[2m'; C_N=$'\033[0m'
+else
+  C_B=""; C_G=""; C_Y=""; C_R=""; C_D=""; C_N=""
+fi
+
+info() { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$C_G" "$C_N" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_Y" "$C_N" "$*" >&2; }
+err()  { printf '%s✗%s %s\n' "$C_R" "$C_N" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+confirm() {
+  [ "$ASSUME_YES" = 1 ] && return 0
+  [ -t 0 ] || return 1
+  local answer
+  printf '%s [y/N] ' "$1"
+  read -r answer || return 1
+  case "$answer" in y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
+}
+
+# ---------------------------------------------------------------- pure helpers
+
+# validate_label LABEL — prints a reason and returns 1 when invalid
+validate_label() {
+  local l="$1"
+  if [ -z "$l" ]; then echo "profile name is empty"; return 1; fi
+  if [ "${#l}" -gt 30 ]; then echo "profile name is longer than 30 characters"; return 1; fi
+  case "$l" in
+    -*|.*|_*) echo "profile name must start with a letter or digit"; return 1 ;;
+    ' '*|*' ') echo "profile name has leading/trailing spaces"; return 1 ;;
+  esac
+  if printf '%s' "$l" | LC_ALL=C grep -q '[^A-Za-z0-9 _-]'; then
+    echo "use only A-Z, a-z, 0-9, space, '-' and '_' (no accents)"; return 1
+  fi
+  case "$(slugify "$l")" in
+    default|claude) echo "'$l' is reserved"; return 1 ;;
+  esac
+  return 0
+}
+
+# slugify "Big Client" -> big-client
+slugify() {
+  printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr ' _' '--' | LC_ALL=C tr -s '-' \
+    | sed -e 's/^-*//' -e 's/-*$//'
+}
+
+# color_hex NAME|#RRGGBB -> #RRGGBB
+color_hex() {
+  local want="$1" entry
+  for entry in $PALETTE; do
+    if [ "${entry%%:*}" = "$want" ]; then echo "${entry#*:}"; return 0; fi
+  done
+  if printf '%s' "$want" | grep -Eq '^#[0-9A-Fa-f]{6}$'; then echo "$want"; return 0; fi
+  return 1
+}
+
+palette_names() {
+  local entry out=""
+  for entry in $PALETTE; do out="$out ${entry%%:*}"; done
+  echo "${out# }"
+}
+
+# palette_pick N -> colour name number N (mod palette size)
+palette_pick() {
+  local n="$1" i=0 entry count=0
+  for entry in $PALETTE; do count=$((count + 1)); done
+  n=$((n % count))
+  for entry in $PALETTE; do
+    if [ "$i" = "$n" ]; then echo "${entry%%:*}"; return 0; fi
+    i=$((i + 1))
+  done
+}
+
+# Reads "PID<TAB>ARGS" lines on stdin; prints PIDs of the main Claude process
+# (not helpers) started with exactly --user-data-dir=DATA_DIR.
+match_profile_pids() {
+  local exe="$1" data="$2"
+  awk -F'\t' -v exe="$exe" -v needle="--user-data-dir=$data" '
+    index($2, exe) != 1 { next }
+    index($2, "--type=") { next }
+    {
+      i = index($2, needle); if (i == 0) next
+      nxt = substr($2, i + length(needle), 1)
+      if (nxt == "" || nxt == " ") print $1
+    }'
+}
+
+# Reads "PID<TAB>ARGS"; prints PIDs of main Claude processes (any profile).
+match_main_pids() {
+  local exe="$1"
+  awk -F'\t' -v exe="$exe" 'index($2, exe) == 1 && !index($2, "--type=") { print $1 }'
+}
+
+# Prints the --user-data-dir value from an args line ("" = default profile).
+# Only valid for our own paths (they end in /data); used for display.
+args_data_dir() {
+  printf '%s\n' "$1" | sed -n 's/.*--user-data-dir=\(.*\/data\)\( .*\)\{0,1\}$/\1/p' | head -1
+}
+
+# ------------------------------------------------------------ profile storage
+
+profile_dir()   { echo "$PROFILES_DIR/$1"; }
+data_dir()      { echo "$PROFILES_DIR/$1/data"; }
+code_dir()      { echo "$PROFILES_DIR/$1/claude-code"; }
+log_file()      { echo "$PROFILES_DIR/$1/launcher.log"; }
+launcher_path() { echo "$LAUNCHER_DIR/Claude $1.app"; }
+
+conf_get() { # slug key
+  local f; f="$(profile_dir "$1")/profile.conf"
+  [ -f "$f" ] || return 0
+  sed -n "s/^$2=//p" "$f" | head -1
+}
+
+profile_exists() { [ -f "$(profile_dir "$1")/profile.conf" ]; }
+
+list_slugs() {
+  local d
+  [ -d "$PROFILES_DIR" ] || return 0
+  for d in "$PROFILES_DIR"/*/; do
+    [ -f "${d}profile.conf" ] || continue
+    d="${d%/}"; echo "${d##*/}"
+  done
+}
+
+profile_label() { local l; l="$(conf_get "$1" LABEL)"; echo "${l:-$1}"; }
+
+# resolve user input (label or slug) -> slug of an existing profile
+resolve_profile() {
+  local slug; slug="$(slugify "$1")"
+  profile_exists "$slug" || die "No profile '$1'. See: claude-dual list"
+  echo "$slug"
+}
+
+# ------------------------------------------------------------- macOS helpers
+
+require_macos() {
+  [ "$(uname -s)" = "Darwin" ] || die "claude-dual only runs on macOS."
+}
+
+plist_get() { /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null || true; }
+
+is_claude_app() {
+  [ -d "$1" ] && [ -f "$1/Contents/Info.plist" ] || return 1
+  case "$(plist_get "$1/Contents/Info.plist" CFBundleIdentifier)" in
+    "$CLAUDE_BUNDLE_ID"|*anthropic*claude*|*Anthropic*Claude*) return 0 ;;
+  esac
+  return 1
+}
+
+find_claude_app() {
+  local p
+  for p in "${CLAUDE_DUAL_APP:-}" "/Applications/Claude.app" "$HOME/Applications/Claude.app"; do
+    if [ -n "$p" ] && is_claude_app "$p"; then echo "$p"; return 0; fi
+  done
+  p="$(mdfind "kMDItemCFBundleIdentifier == '$CLAUDE_BUNDLE_ID'" 2>/dev/null | grep '\.app$' | grep -v '/claude-dual/' | head -1 || true)"
+  if [ -n "$p" ] && is_claude_app "$p"; then echo "$p"; return 0; fi
+  return 1
+}
+
+claude_exe() { # app -> absolute path of the main executable
+  local name; name="$(plist_get "$1/Contents/Info.plist" CFBundleExecutable)"
+  echo "$1/Contents/MacOS/${name:-Claude}"
+}
+
+ps_lines() { ps -axww -o pid= -o args= | sed -e 's/^ *//' -e 's/ /	/'; }
+
+profile_pids() { ps_lines | match_profile_pids "$1" "$2"; }
+
+main_pids() { ps_lines | match_main_pids "$1"; }
+
+pid_args() { ps -ww -o args= -p "$1" 2>/dev/null || true; }
+
+# label for a running main process
+describe_pid() {
+  local args dd slug
+  args="$(pid_args "$1")"
+  case "$args" in
+    *--user-data-dir=*) ;;
+    *) echo "Claude (default account)"; return ;;
+  esac
+  dd="$(args_data_dir "$args")"
+  case "$dd" in
+    "$PROFILES_DIR"/*/data)
+      slug="${dd#"$PROFILES_DIR"/}"; slug="${slug%/data}"
+      echo "Claude $(profile_label "$slug")"; return ;;
+  esac
+  echo "Claude (unknown --user-data-dir)"
+}
+
+quit_pid() {
+  osascript -l JavaScript -e "ObjC.import('AppKit');
+    var a = \$.NSRunningApplication.runningApplicationWithProcessIdentifier($1);
+    a.isNil() ? false : a.terminate;" >/dev/null 2>&1 || kill -TERM "$1" 2>/dev/null || true
+}
+
+wait_gone() { # pid timeout_seconds
+  local i=0
+  while kill -0 "$1" 2>/dev/null; do
+    [ "$i" -ge "$(($2 * 2))" ] && return 1
+    sleep 0.5; i=$((i + 1))
+  done
+  return 0
+}
+
+file_url() {
+  local u
+  u="$(osascript -l JavaScript -e 'ObjC.import("Foundation"); function run(a) { return $.NSURL.fileURLWithPath(a[0]).absoluteString.js; }' "$1")"
+  case "$u" in */) ;; *) u="$u/" ;; esac
+  echo "$u"
+}
+
+lsregister() {
+  local t=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+  [ -x "$t" ] && "$t" "$@" >/dev/null 2>&1 || true
+}
+
+# ------------------------------------------------------------------- icons
+
+# make_icon TEXT #RRGGBB OUT.icns — original artwork: rounded tile + letter
+make_icon() {
+  local text="$1" hex="$2" out="$3" tmp size dbl
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/claude-dual-icon.XXXXXX")"
+  if ! osascript -l JavaScript - "$text" "$hex" "$tmp/icon.png" >/dev/null 2>&1 <<'JXA'
+ObjC.import('AppKit');
+function run(argv) {
+  var text = argv[0], hex = argv[1], out = argv[2], S = 1024;
+  function c(h, i) { return parseInt(h.substr(i, 2), 16) / 255; }
+  var base = $.NSColor.colorWithSRGBRedGreenBlueAlpha(c(hex, 1), c(hex, 3), c(hex, 5), 1);
+  var light = base.blendedColorWithFractionOfColor(0.22, $.NSColor.whiteColor);
+  var rep = $.NSBitmapImageRep.alloc.initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(
+    null, S, S, 8, 4, true, false, 'NSDeviceRGBColorSpace', 0, 0);
+  var ctx = $.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep);
+  $.NSGraphicsContext.saveGraphicsState;
+  $.NSGraphicsContext.setCurrentContext(ctx);
+  var tile = $.NSBezierPath.bezierPathWithRoundedRectXRadiusYRadius($.NSMakeRect(100, 100, 824, 824), 186, 186);
+  var grad = $.NSGradient.alloc.initWithStartingColorEndingColor(base, light);
+  grad.drawInBezierPathAngle(tile, 90);
+  var ring = $.NSBezierPath.bezierPathWithOvalInRect($.NSMakeRect(232, 232, 560, 560));
+  ring.lineWidth = 34;
+  $.NSColor.colorWithSRGBRedGreenBlueAlpha(1, 1, 1, 0.9).setStroke;
+  ring.stroke;
+  var font = $.NSFont.systemFontOfSizeWeight(text.length > 1 ? 230 : 300, 0.4);
+  var attrs = $.NSDictionary.dictionaryWithObjectsForKeys(
+    $([font, $.NSColor.whiteColor]), $(['NSFont', 'NSColor']));
+  var str = $(text);
+  var sz = str.sizeWithAttributes(attrs);
+  str.drawAtPointWithAttributes($.NSMakePoint((S - sz.width) / 2, (S - sz.height) / 2 + 6), attrs);
+  $.NSGraphicsContext.restoreGraphicsState;
+  var png = rep.representationUsingTypeProperties(4 /* NSBitmapImageFileTypePNG */, $({}));
+  return png.writeToFileAtomically(out, true) ? 'ok' : 'fail';
+}
+JXA
+  then rm -rf "$tmp"; return 1; fi
+  [ -s "$tmp/icon.png" ] || { rm -rf "$tmp"; return 1; }
+  mkdir -p "$tmp/icon.iconset"
+  for size in 16 32 128 256 512; do
+    dbl=$((size * 2))
+    sips -z "$size" "$size" "$tmp/icon.png" --out "$tmp/icon.iconset/icon_${size}x${size}.png" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
+    sips -z "$dbl" "$dbl" "$tmp/icon.png" --out "$tmp/icon.iconset/icon_${size}x${size}@2x.png" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
+  done
+  iconutil -c icns "$tmp/icon.iconset" -o "$out" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+}
+
+icon_text() { # label -> 1-2 uppercase characters
+  local words first second
+  words="$(printf '%s' "$1" | LC_ALL=C tr '_-' '  ')"
+  # shellcheck disable=SC2086
+  set -- $words
+  first="$(printf '%s' "${1:-?}" | cut -c1)"
+  second=""
+  [ $# -ge 2 ] && second="$(printf '%s' "$2" | cut -c1)"
+  printf '%s%s' "$first" "$second" | LC_ALL=C tr '[:lower:]' '[:upper:]'
+}
+
+# ---------------------------------------------------------------- launcher
+
+# render_launch_script LABEL DATA_DIR CODE_DIR CLAUDE_APP LOG
+# The launcher is self-contained: it keeps working if this repo is moved.
+render_launch_script() {
+  printf '#!/bin/bash\n'
+  printf '# Generated by claude-dual %s (launcher v%s). Rebuild with: claude-dual rebuild\n' "$VERSION" "$LAUNCHER_VERSION"
+  printf 'LABEL=%q\n' "$1"
+  printf 'DATA_DIR=%q\n' "$2"
+  printf 'CODE_DIR=%q\n' "$3"
+  printf 'CLAUDE_APP=%q\n' "$4"
+  printf 'LOG=%q\n' "$5"
+  printf 'BUNDLE_ID=%q\n' "$CLAUDE_BUNDLE_ID"
+  cat <<'BODY'
+
+mkdir -p "$DATA_DIR" "$CODE_DIR" "$(dirname "$LOG")"
+if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -gt 200000 ]; then
+  tail -n 300 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+exec >>"$LOG" 2>&1
+echo "--- $(date '+%Y-%m-%d %H:%M:%S') open '$LABEL'"
+
+if [ ! -d "$CLAUDE_APP" ]; then
+  for p in /Applications/Claude.app "$HOME/Applications/Claude.app"; do
+    if [ -d "$p" ]; then CLAUDE_APP="$p"; break; fi
+  done
+fi
+if [ ! -d "$CLAUDE_APP" ]; then
+  CLAUDE_APP="$(mdfind "kMDItemCFBundleIdentifier == '$BUNDLE_ID'" 2>/dev/null | grep '\.app$' | head -1)"
+fi
+if [ -z "$CLAUDE_APP" ] || [ ! -d "$CLAUDE_APP" ]; then
+  echo "Claude.app not found"
+  osascript -e 'display alert "Claude.app not found" message "Install Claude Desktop from claude.ai/download, then try again."' >/dev/null 2>&1
+  exit 1
+fi
+
+EXE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$CLAUDE_APP/Contents/Info.plist" 2>/dev/null)"
+EXE="$CLAUDE_APP/Contents/MacOS/${EXE_NAME:-Claude}"
+
+find_pid() {
+  ps -axww -o pid= -o args= | sed -e 's/^ *//' -e 's/ /	/' |
+    awk -F'\t' -v exe="$EXE" -v needle="--user-data-dir=$DATA_DIR" '
+      index($2, exe) != 1 { next }
+      index($2, "--type=") { next }
+      { i = index($2, needle); if (i == 0) next
+        nxt = substr($2, i + length(needle), 1)
+        if (nxt == "" || nxt == " ") { print $1; exit } }'
+}
+
+start_direct() {
+  CLAUDE_CONFIG_DIR="$CODE_DIR" nohup "$EXE" --user-data-dir="$DATA_DIR" >/dev/null 2>&1 &
+}
+
+pid="$(find_pid)"
+if [ -n "$pid" ]; then
+  echo "already running (pid $pid): focusing"
+  osascript -l JavaScript -e "ObjC.import('AppKit');
+    var a = \$.NSRunningApplication.runningApplicationWithProcessIdentifier($pid);
+    if (!a.isNil()) a.activateWithOptions(3);" >/dev/null 2>&1
+  sleep 0.4
+  front="$(osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier" 2>/dev/null)"
+  if [ "$front" != "$pid" ]; then
+    # The app's single-instance lock (per data dir) hands this off to the
+    # running window and exits, so no second copy of the profile is opened.
+    echo "activation not confirmed (front=$front): handing off to running instance"
+    start_direct
+  fi
+  exit 0
+fi
+
+echo "starting $EXE"
+# open(1) registers the app with LaunchServices properly; older macOS without
+# --env rejects the option and we start the binary directly instead.
+if ! open -n -a "$CLAUDE_APP" --env "CLAUDE_CONFIG_DIR=$CODE_DIR" --args --user-data-dir="$DATA_DIR"; then
+  echo "open --env failed: starting directly"
+  start_direct
+fi
+BODY
+}
+
+build_launcher() { # slug label hex claude_app
+  local slug="$1" label="$2" hex="$3" app="$4"
+  local dest tmp bundle res plist
+  dest="$(launcher_path "$label")"
+
+  if [ -e "$dest" ] && [ ! -f "$dest/Contents/Resources/$MARKER" ]; then
+    die "'$dest' exists and was not made by claude-dual. Rename or remove it first."
+  fi
+
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/claude-dual.XXXXXX")"
+  bundle="$tmp/launcher.app"
+  cat >"$tmp/main.applescript" <<'APPLESCRIPT'
+set launchScript to (POSIX path of (path to me)) & "Contents/Resources/launch.sh"
+do shell script "/bin/bash " & quoted form of launchScript & " >/dev/null 2>&1 &"
+APPLESCRIPT
+  osacompile -o "$bundle" "$tmp/main.applescript" >/dev/null 2>&1 || { rm -rf "$tmp"; die "osacompile failed"; }
+
+  res="$bundle/Contents/Resources"
+  plist="$bundle/Contents/Info.plist"
+  render_launch_script "$label" "$(data_dir "$slug")" "$(code_dir "$slug")" "$app" "$(log_file "$slug")" >"$res/launch.sh"
+  chmod 755 "$res/launch.sh"
+  printf 'slug=%s\nlabel=%s\nlauncher_version=%s\ntool_version=%s\n' \
+    "$slug" "$label" "$LAUNCHER_VERSION" "$VERSION" >"$res/$MARKER"
+
+  plutil -replace CFBundleIdentifier -string "$ID_PREFIX.$slug" "$plist"
+  plutil -replace CFBundleName -string "Claude $label" "$plist"
+  plutil -replace CFBundleDisplayName -string "Claude $label" "$plist"
+  # No extra Dock icon for the launcher itself while it hands off to Claude.
+  plutil -replace LSUIElement -bool YES "$plist"
+
+  if make_icon "$(icon_text "$label")" "$hex" "$tmp/applet.icns"; then
+    cp "$tmp/applet.icns" "$res/applet.icns"
+    rm -f "$res/Assets.car"
+    plutil -remove CFBundleIconName "$plist" >/dev/null 2>&1 || true
+    plutil -replace CFBundleIconFile -string applet "$plist"
+  else
+    warn "Could not draw the icon; the launcher will use the default script icon."
+  fi
+
+  codesign --force --deep --sign - "$bundle" >/dev/null 2>&1 || warn "Ad-hoc code signing failed (launcher may still work)."
+
+  mkdir -p "$LAUNCHER_DIR"
+  rm -rf "$dest"
+  mv "$bundle" "$dest"
+  rm -rf "$tmp"
+  touch "$dest"
+  lsregister -f "$dest"
+}
+
+# -------------------------------------------------------------------- Dock
+
+dock_pin() {
+  local url
+  url="$(file_url "$1")"
+  if defaults read com.apple.dock persistent-apps 2>/dev/null | grep -qF "$url"; then
+    info "  Dock: already pinned"; return 0
+  fi
+  defaults write com.apple.dock persistent-apps -array-add \
+    "<dict><key>tile-data</key><dict><key>file-data</key><dict><key>_CFURLString</key><string>$url</string><key>_CFURLStringType</key><integer>15</integer></dict></dict></dict>"
+  killall Dock >/dev/null 2>&1 || true
+  info "  Dock: pinned"
+}
+
+dock_unpin() {
+  local url tmp i entry changed=0 pb=/usr/libexec/PlistBuddy
+  url="$(file_url "$1")"
+  defaults read com.apple.dock persistent-apps 2>/dev/null | grep -qF "$url" || return 0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/claude-dual-dock.XXXXXX")"
+  defaults export com.apple.dock "$tmp"
+  i=0
+  while "$pb" -c "Print :persistent-apps:$i" "$tmp" >/dev/null 2>&1; do
+    entry="$("$pb" -c "Print :persistent-apps:$i:tile-data:file-data:_CFURLString" "$tmp" 2>/dev/null || true)"
+    if [ "$entry" = "$url" ]; then
+      "$pb" -c "Delete :persistent-apps:$i" "$tmp"; changed=1
+    else
+      i=$((i + 1))
+    fi
+  done
+  if [ "$changed" = 1 ]; then
+    defaults import com.apple.dock "$tmp"
+    killall Dock >/dev/null 2>&1 || true
+    info "  Dock: unpinned"
+  fi
+  rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_create() {
+  local labels="" color="" dock=0 open_after=0 app label last="" slug hex existing n reason
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --color) [ $# -ge 2 ] || die "--color needs a value ($(palette_names) or #RRGGBB)"; color="$2"; shift ;;
+      --color=*) color="${1#--color=}" ;;
+      --dock) dock=1 ;;
+      --open) open_after=1 ;;
+      -*) die "Unknown option for create: $1" ;;
+      *) labels="$labels$1"$'\n' ;;
+    esac
+    shift
+  done
+  [ -n "$labels" ] || die "Usage: claude-dual create <Label> [--color NAME] [--dock] [--open]"
+
+  require_macos
+  app="$(find_claude_app)" || die "Claude Desktop not found. Install it from https://claude.ai/download"
+  if [ -n "$color" ]; then
+    color_hex "$color" >/dev/null || die "Unknown colour '$color'. Use one of: $(palette_names) or #RRGGBB"
+  fi
+
+  while IFS= read -r label; do
+    [ -n "$label" ] || continue
+    last="$label"
+    reason="$(validate_label "$label")" || die "Invalid name '$label': $reason"
+    slug="$(slugify "$label")"
+    existing="$(conf_get "$slug" LABEL)"
+    if [ -n "$existing" ] && [ "$existing" != "$label" ]; then
+      die "'$label' clashes with existing profile '$existing'. Pick another name."
+    fi
+
+    if [ -n "$color" ]; then
+      hex="$(color_hex "$color")"; n="$color"
+    elif [ -n "$(conf_get "$slug" COLOR)" ]; then
+      n="$(conf_get "$slug" COLOR)"; hex="$(color_hex "$n" || color_hex indigo)"
+    else
+      n="$(palette_pick "$(list_slugs | wc -l | tr -d ' ')")"; hex="$(color_hex "$n")"
+    fi
+
+    mkdir -p "$(data_dir "$slug")" "$(code_dir "$slug")"
+    {
+      echo "LABEL=$label"
+      echo "COLOR=$n"
+      echo "CREATED=$(conf_get "$slug" CREATED | grep . || date '+%Y-%m-%d')"
+    } >"$(profile_dir "$slug")/profile.conf.tmp"
+    mv "$(profile_dir "$slug")/profile.conf.tmp" "$(profile_dir "$slug")/profile.conf"
+
+    build_launcher "$slug" "$label" "$hex" "$app"
+    if [ -n "$existing" ]; then ok "Rebuilt 'Claude $label' (data kept)"; else ok "Created 'Claude $label'"; fi
+    info "  Launcher : $(launcher_path "$label")"
+    info "  Data     : $(data_dir "$slug")"
+    info "  Colour   : $n"
+    [ "$dock" = 1 ] && dock_pin "$(launcher_path "$label")"
+    if [ "$open_after" = 1 ]; then open "$(launcher_path "$label")"; fi
+  done <<EOF
+$labels
+EOF
+
+  echo
+  info "${C_B}Next:${C_N} sign in with:  ./claude-dual login \"$last\""
+  info "${C_D}(Sign-in links go to the first running Claude, so 'login' quits the others first.)${C_N}"
+}
+
+cmd_open() {
+  [ $# -ge 1 ] || die "Usage: claude-dual open <Label>"
+  require_macos
+  local slug label dest
+  slug="$(resolve_profile "$1")"; label="$(profile_label "$slug")"; dest="$(launcher_path "$label")"
+  [ -d "$dest" ] || die "Launcher missing. Run: claude-dual create \"$label\""
+  open "$dest"
+  ok "Opening 'Claude $label'"
+}
+
+cmd_login() {
+  [ $# -ge 1 ] || die "Usage: claude-dual login <Label>"
+  require_macos
+  local slug label app exe pid others="" mine names="" stuck=""
+  slug="$(resolve_profile "$1")"; label="$(profile_label "$slug")"
+  app="$(find_claude_app)" || die "Claude Desktop not found."
+  exe="$(claude_exe "$app")"
+  mine="$(profile_pids "$exe" "$(data_dir "$slug")" | tr '\n' ' ')"
+
+  for pid in $(main_pids "$exe"); do
+    case " $mine " in *" $pid "*) continue ;; esac
+    others="$others $pid"
+    names="$names"$'\n'"  - $(describe_pid "$pid") (pid $pid)"
+  done
+
+  if [ -n "$others" ]; then
+    info "Claude sends the sign-in link to the Claude window that was opened first,"
+    info "so these must be closed while you sign in to '$label':$names"
+    confirm "Quit them now? (chats are saved; you can reopen them right after)" ||
+      die "Cancelled. Quit them yourself (⌘Q), then run this again."
+    for pid in $others; do quit_pid "$pid"; done
+    for pid in $others; do wait_gone "$pid" 20 || stuck="$stuck $pid"; done
+    [ -z "$stuck" ] || die "Some Claude windows did not quit (pid$stuck). Quit them with ⌘Q, then retry."
+    ok "Other Claude windows closed"
+  fi
+
+  open "$(launcher_path "$label")"
+  ok "Opened 'Claude $label'"
+  info "Sign in there now. When it shows the right account, you can reopen your other Claude apps."
+}
+
+cmd_list() {
+  require_macos
+  local app="" exe="" slug label pids any=0
+  app="$(find_claude_app || true)"
+  [ -n "$app" ] && exe="$(claude_exe "$app")"
+  for slug in $(list_slugs); do
+    any=1
+    label="$(profile_label "$slug")"
+    pids=""
+    [ -n "$exe" ] && pids="$(profile_pids "$exe" "$(data_dir "$slug")" | tr '\n' ' ')"
+    printf '%s%-24s%s %-8s %s\n' "$C_B" "Claude $label" "$C_N" "$(conf_get "$slug" COLOR)" \
+      "$([ -n "$pids" ] && echo "${C_G}running${C_N} (pid ${pids% })" || echo "${C_D}stopped${C_N}")"
+  done
+  [ "$any" = 1 ] || info "No profiles yet. Create one: ./claude-dual create Work"
+}
+
+cmd_doctor() {
+  require_macos
+  local problems=0 app exe ver bid slug label dd pids pid envs n args
+  info "${C_B}claude-dual $VERSION${C_N}"
+  info "macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)), $(uname -m)"
+
+  if app="$(find_claude_app)"; then
+    ver="$(plist_get "$app/Contents/Info.plist" CFBundleShortVersionString)"
+    bid="$(plist_get "$app/Contents/Info.plist" CFBundleIdentifier)"
+    exe="$(claude_exe "$app")"
+    ok "Claude $ver at $app ($bid)"
+  else
+    err "Claude Desktop not found"; return 1
+  fi
+
+  for t in osacompile codesign sips iconutil osascript; do
+    command -v "$t" >/dev/null 2>&1 || { err "missing tool: $t"; problems=$((problems + 1)); }
+  done
+  if open 2>&1 | grep -q -- '--env'; then ok "open --env supported"; else warn "open --env not listed; launchers fall back to starting Claude directly"; fi
+  if [ -d "$DEFAULT_DATA_DIR" ]; then
+    info "  ${C_D}Default account data: $DEFAULT_DATA_DIR${C_N}"
+  fi
+
+  echo
+  info "${C_B}Running Claude windows${C_N}"
+  n=0
+  for pid in $(main_pids "$exe"); do
+    n=$((n + 1)); info "  - $(describe_pid "$pid") (pid $pid)"
+  done
+  [ "$n" = 0 ] && info "  (none)"
+
+  for slug in $(list_slugs); do
+    label="$(profile_label "$slug")"; dd="$(data_dir "$slug")"
+    echo
+    info "${C_B}Claude $label${C_N}"
+    if [ -f "$(launcher_path "$label")/Contents/Resources/$MARKER" ]; then
+      if grep -q "^launcher_version=$LAUNCHER_VERSION\$" "$(launcher_path "$label")/Contents/Resources/$MARKER"; then
+        ok "launcher ok"
+      else
+        warn "launcher is outdated: run ./claude-dual rebuild"
+      fi
+    else
+      err "launcher missing: run ./claude-dual create \"$label\""; problems=$((problems + 1))
+    fi
+
+    n="$(find "$dd" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+    pids="$(profile_pids "$exe" "$dd" | tr '\n' ' ')"
+    if [ -n "$pids" ]; then
+      pid="${pids%% *}"
+      if [ "$n" -gt 0 ]; then
+        ok "running (pid $pid), data isolated in its own folder ($n items)"
+      else
+        err "running but its data folder is empty: this Claude version may ignore --user-data-dir"
+        problems=$((problems + 1))
+      fi
+      envs="$(ps -E -ww -o command= -p "$pid" 2>/dev/null || true)"
+      case "$envs" in
+        *"CLAUDE_CONFIG_DIR=$(code_dir "$slug")"*) ok "Claude Code isolated (CLAUDE_CONFIG_DIR set)" ;;
+        *=*) warn "CLAUDE_CONFIG_DIR not set (Claude relaunched itself, e.g. after an update?). Quit it and reopen from the launcher." ;;
+        *) info "  ${C_D}(could not read process environment)${C_N}" ;;
+      esac
+    elif [ "$n" -gt 0 ]; then
+      ok "stopped, data folder has $n items"
+    else
+      info "  not opened yet: ./claude-dual login \"$label\""
+    fi
+  done
+
+  # A Claude process with a --user-data-dir we don't know about, or a second
+  # default instance, means something relaunched without its flags.
+  n=0
+  for pid in $(main_pids "$exe"); do
+    args="$(pid_args "$pid")"
+    case "$args" in *--user-data-dir=*) ;; *) n=$((n + 1)) ;; esac
+  done
+  if [ "$n" -gt 1 ]; then
+    err "$n Claude windows are using the default account folder; one probably lost its profile (e.g. after an auto-update). Quit them all and reopen from the launchers."
+    problems=$((problems + 1))
+  fi
+
+  echo
+  if [ "$problems" = 0 ]; then ok "No problems found"; else err "$problems problem(s) found"; return 1; fi
+}
+
+cmd_remove() {
+  local purge=0 target="" slug label exe app pids dest
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge) purge=1 ;;
+      -*) die "Unknown option for remove: $1" ;;
+      *) target="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$target" ] || die "Usage: claude-dual remove <Label> [--purge]"
+  require_macos
+  slug="$(resolve_profile "$target")"; label="$(profile_label "$slug")"; dest="$(launcher_path "$label")"
+
+  if app="$(find_claude_app)"; then
+    exe="$(claude_exe "$app")"
+    pids="$(profile_pids "$exe" "$(data_dir "$slug")" | tr '\n' ' ')"
+    [ -z "$pids" ] || die "'Claude $label' is running. Quit it first (⌘Q)."
+  fi
+
+  if [ -d "$dest" ]; then
+    [ -f "$dest/Contents/Resources/$MARKER" ] || die "'$dest' was not made by claude-dual; not touching it."
+    dock_unpin "$dest"
+    rm -rf "$dest"
+    lsregister -u "$dest"
+    ok "Removed launcher 'Claude $label'"
+  fi
+
+  if [ "$purge" = 1 ]; then
+    if confirm "Delete ALL data of 'Claude $label' (sign-in, chats cache, settings, Claude Code sessions)?"; then
+      rm -rf "$(profile_dir "$slug")"
+      ok "Deleted data of '$label'"
+    else
+      info "Data kept at $(profile_dir "$slug")"
+    fi
+  else
+    info "Data kept at $(profile_dir "$slug") (delete with: ./claude-dual remove \"$label\" --purge)"
+    rm -f "$(profile_dir "$slug")/profile.conf.removed"
+    mv "$(profile_dir "$slug")/profile.conf" "$(profile_dir "$slug")/profile.conf.removed"
+  fi
+}
+
+cmd_rebuild() {
+  require_macos
+  local app slug label hex any=0
+  app="$(find_claude_app)" || die "Claude Desktop not found."
+  for slug in $(list_slugs); do
+    any=1
+    label="$(profile_label "$slug")"
+    hex="$(color_hex "$(conf_get "$slug" COLOR)" || color_hex indigo)"
+    build_launcher "$slug" "$label" "$hex" "$app"
+    ok "Rebuilt 'Claude $label'"
+  done
+  [ "$any" = 1 ] || info "No profiles to rebuild."
+}
+
+usage() {
+  cat <<EOF
+${C_B}claude-dual $VERSION${C_N} — several Claude Desktop accounts side by side on macOS
+
+Usage:
+  ./claude-dual create <Label> [--color NAME] [--dock] [--open]
+                                  Make "Claude <Label>.app" in ~/Applications
+  ./claude-dual login <Label>     Quit other Claude windows, open <Label> to sign in
+  ./claude-dual open <Label>      Open (or focus) a profile
+  ./claude-dual list              Show profiles and which are running
+  ./claude-dual doctor            Check Claude version and that profiles are isolated
+  ./claude-dual rebuild           Rebuild all launchers (after updating claude-dual)
+  ./claude-dual remove <Label> [--purge]
+                                  Remove the launcher (--purge also deletes its data)
+
+Options:  -y, --yes   answer yes to questions     -h, --help   -v, --version
+Colours:  $(palette_names), or #RRGGBB
+
+Your normal Claude app stays your first account. Each profile adds one more.
+EOF
+}
+
+main() {
+  local args=() a cmd
+  for a in "$@"; do
+    case "$a" in
+      -y|--yes) ASSUME_YES=1 ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+  cmd="${1:-help}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    create|add)          cmd_create "$@" ;;
+    login|signin)        cmd_login "$@" ;;
+    open)                cmd_open "$@" ;;
+    list|ls)             cmd_list ;;
+    doctor|check)        cmd_doctor ;;
+    rebuild|upgrade)     cmd_rebuild ;;
+    remove|rm|delete)    cmd_remove "$@" ;;
+    -v|--version|version) echo "claude-dual $VERSION" ;;
+    -h|--help|help)      usage ;;
+    *) err "Unknown command: $cmd"; echo; usage; exit 1 ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

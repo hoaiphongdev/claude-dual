@@ -1,0 +1,2 @@
+# info-level checks that do not apply here (ps parsing is intentional)
+disable=SC2009,SC2012,SC2153
